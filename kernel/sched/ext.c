@@ -1032,6 +1032,7 @@ static struct kobject *scx_root_kobj;
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched_ext.h>
+#undef CREATE_TRACE_POINTS
 
 static void process_ddsp_deferred_locals(struct rq *rq);
 static void scx_bpf_kick_cpu(s32 cpu, u64 flags);
@@ -6422,6 +6423,9 @@ static bool check_builtin_idle_enabled(void)
 __bpf_kfunc s32 scx_bpf_select_cpu_dfl(struct task_struct *p, s32 prev_cpu,
 				       u64 wake_flags, bool *is_idle)
 {
+	if (!ops_cpu_valid(prev_cpu, NULL))
+		goto prev_cpu;
+
 	if (!check_builtin_idle_enabled())
 		goto prev_cpu;
 

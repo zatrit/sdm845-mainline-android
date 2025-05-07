@@ -161,6 +161,7 @@
 #include <net/page_pool/helpers.h>
 #include <net/rps.h>
 #include <linux/phy_link_topology.h>
+#include <trace/hooks/net.h>
 
 #include "dev.h"
 #include "devmem.h"
@@ -570,6 +571,12 @@ static inline void netdev_set_addr_lockdep_class(struct net_device *dev)
 
 static inline struct list_head *ptype_head(const struct packet_type *pt)
 {
+	struct list_head vendor_pt = { .next  = NULL, };
+
+	trace_android_vh_ptype_head(pt, &vendor_pt);
+	if (vendor_pt.next)
+		return vendor_pt.next;
+
 	if (pt->type == htons(ETH_P_ALL))
 		return pt->dev ? &pt->dev->ptype_all : &net_hotdata.ptype_all;
 	else
@@ -3871,6 +3878,9 @@ EXPORT_SYMBOL(skb_csum_hwoffload_help);
 static struct sk_buff *validate_xmit_skb(struct sk_buff *skb, struct net_device *dev, bool *again)
 {
 	netdev_features_t features;
+
+	if (!skb_frags_readable(skb))
+		goto out_kfree_skb;
 
 	features = netif_skb_features(skb);
 	skb = validate_xmit_vlan(skb, features);

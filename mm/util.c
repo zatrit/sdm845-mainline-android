@@ -23,6 +23,7 @@
 #include <linux/processor.h>
 #include <linux/sizes.h>
 #include <linux/compat.h>
+#include <linux/fsnotify.h>
 
 #include <linux/uaccess.h>
 
@@ -30,6 +31,10 @@
 
 #include "internal.h"
 #include "swap.h"
+
+#ifndef __GENSYMS__
+#include <trace/hooks/syscall_check.h>
+#endif
 
 /**
  * kfree_const - conditionally free memory
@@ -569,6 +574,8 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 	LIST_HEAD(uf);
 
 	ret = security_mmap_file(file, prot, flag);
+	if (!ret)
+		ret = fsnotify_mmap_perm(file, prot, pgoff >> PAGE_SHIFT, len);
 	if (!ret) {
 		if (mmap_write_lock_killable(mm))
 			return -EINTR;
@@ -579,6 +586,7 @@ unsigned long vm_mmap_pgoff(struct file *file, unsigned long addr,
 		if (populate)
 			mm_populate(ret, populate);
 	}
+	trace_android_vh_check_mmap_file(file, prot, flag, ret);
 	return ret;
 }
 

@@ -41,6 +41,8 @@
 #include <linux/thread_info.h>
 #include <linux/prctl.h>
 #include <linux/stacktrace.h>
+#include <trace/hooks/mpam.h>
+#include <trace/hooks/fpsimd.h>
 
 #include <asm/alternative.h>
 #include <asm/arch_timer.h>
@@ -247,6 +249,7 @@ void show_regs(struct pt_regs *regs)
 	__show_regs(regs);
 	dump_backtrace(regs, NULL, KERN_DEFAULT);
 }
+EXPORT_SYMBOL_GPL(show_regs);
 
 static void tls_thread_flush(void)
 {
@@ -288,7 +291,9 @@ static void flush_gcs(void)
 	if (!system_supports_gcs())
 		return;
 
-	gcs_free(current);
+	current->thread.gcspr_el0 = 0;
+	current->thread.gcs_base = 0;
+	current->thread.gcs_size = 0;
 	current->thread.gcs_el0_mode = 0;
 	write_sysreg_s(GCSCRE0_EL1_nTR, SYS_GCSCRE0_EL1);
 	write_sysreg_s(0, SYS_GCSPR_EL0);
@@ -671,6 +676,11 @@ static void permission_overlay_switch(struct task_struct *next)
 	current->thread.por_el0 = read_sysreg_s(SYS_POR_EL0);
 	if (current->thread.por_el0 != next->thread.por_el0) {
 		write_sysreg_s(next->thread.por_el0, SYS_POR_EL0);
+		/*
+		 * No ISB required as we can tolerate spurious Overlay faults -
+		 * the fault handler will check again based on the new value
+		 * of POR_EL0.
+		 */
 	}
 }
 
@@ -713,6 +723,12 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	gcs_thread_switch(next);
 
 	/*
+	 *  vendor hook is needed before the dsb(),
+	 *  because MPAM is related to cache maintenance.
+	 */
+	trace_android_vh_mpam_set(prev, next);
+
+	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case the
 	 * thread migrates to a different CPU. This full barrier is also
 	 * required by the membarrier system call. Additionally it makes any
@@ -730,6 +746,8 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	/* avoid expensive SCTLR_EL1 accesses if no change */
 	if (prev->thread.sctlr_user != next->thread.sctlr_user)
 		update_sctlr_el1(next->thread.sctlr_user);
+
+	trace_android_vh_is_fpsimd_save(prev, next);
 
 	/* the actual thread switch */
 	last = cpu_switch_to(prev, next);

@@ -74,4 +74,5 @@ lan966x-pci-objs		:= lan966x_pci.o
 lan966x-pci-objs		+= lan966x_pci.dtbo.o
 obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
 obj-y				+= keba/
+obj-$(CONFIG_UID_SYS_STATS)	+= uid_sys_stats.o
 obj-y				+= amd-sbi/

@@ -14,6 +14,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/irqdomain.h>
+#include <linux/wakeup_reason.h>
 
 #include <trace/events/irq.h>
 
@@ -205,6 +206,14 @@ __irq_startup_managed(struct irq_desc *desc, const struct cpumask *aff,
 
 void irq_startup_managed(struct irq_desc *desc)
 {
+	struct irq_data *d = irq_desc_get_irq_data(desc);
+
+	/*
+	 * Clear managed-shutdown flag, so we don't repeat managed-startup for
+	 * multiple hotplugs, and cause imbalanced disable depth.
+	 */
+	irqd_clr_managed_shutdown(d);
+
 	/*
 	 * Only start it up when the disable depth is 1, so that a disable,
 	 * hotunplug, hotplug sequence does not end up enabling it during
@@ -464,8 +473,22 @@ static bool irq_can_handle_pm(struct irq_desc *desc)
 	 * If the interrupt is not in progress and is not an armed
 	 * wakeup interrupt, proceed.
 	 */
-	if (!irqd_has_set(&desc->irq_data, mask))
+	if (!irqd_has_set(&desc->irq_data, mask)) {
+#ifdef CONFIG_PM_SLEEP
+		if (unlikely(desc->no_suspend_depth &&
+			     irqd_is_wakeup_set(&desc->irq_data))) {
+			unsigned int irq = irq_desc_get_irq(desc);
+			const char *name = "(unnamed)";
+
+			if (desc->action && desc->action->name)
+				name = desc->action->name;
+
+			log_abnormal_wakeup_reason("misconfigured IRQ %u %s",
+						   irq, name);
+		}
+#endif
 		return true;
+	}
 
 	/*
 	 * If the interrupt is an armed wakeup source, mark it pending

@@ -34,6 +34,7 @@
 #include <linux/cpufreq.h>
 #include <linux/devfreq.h>
 #include <linux/timer.h>
+#include <linux/wakeup_reason.h>
 
 #include "../base.h"
 #include "power.h"
@@ -60,6 +61,7 @@ static LIST_HEAD(dpm_suspended_list);
 static LIST_HEAD(dpm_late_early_list);
 static LIST_HEAD(dpm_noirq_list);
 
+struct suspend_stats suspend_stats;
 static DEFINE_MUTEX(dpm_list_mtx);
 static pm_message_t pm_transition;
 
@@ -1237,6 +1239,7 @@ void dpm_complete(pm_message_t state)
 void dpm_resume_end(pm_message_t state)
 {
 	dpm_resume(state);
+	pm_restore_gfp_mask();
 	dpm_complete(state);
 }
 EXPORT_SYMBOL_GPL(dpm_resume_end);
@@ -1277,6 +1280,22 @@ static void dpm_async_suspend_parent(struct device *dev, async_func_t func)
 	/* Start processing the device's parent if it is "async". */
 	if (dev->parent)
 		dpm_async_with_cleanup(dev->parent, func);
+}
+
+static void dpm_async_suspend_complete_all(struct list_head *device_list)
+{
+	struct device *dev;
+
+	guard(mutex)(&async_wip_mtx);
+
+	list_for_each_entry_reverse(dev, device_list, power.entry) {
+		/*
+		 * In case the device is being waited for and async processing
+		 * has not started for it yet, let the waiters make progress.
+		 */
+		if (!dev->power.work_in_progress)
+			complete_all(&dev->power.completion);
+	}
 }
 
 /**
@@ -1372,6 +1391,8 @@ Run:
 	error = dpm_run_callback(callback, dev, state, info);
 	if (error) {
 		async_error = error;
+		log_suspend_abort_reason("Device %s failed to %s noirq: error %d",
+					 dev_name(dev), pm_verb(state.event), error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async noirq" : " noirq", error);
 		goto Complete;
@@ -1455,6 +1476,7 @@ static int dpm_noirq_suspend_devices(pm_message_t state)
 		mutex_lock(&dpm_list_mtx);
 
 		if (error || async_error) {
+			dpm_async_suspend_complete_all(&dpm_late_early_list);
 			/*
 			 * Move all devices to the target list to resume them
 			 * properly.
@@ -1580,6 +1602,8 @@ Run:
 	error = dpm_run_callback(callback, dev, state, info);
 	if (error) {
 		async_error = error;
+		log_suspend_abort_reason("Device %s failed to %s late: error %d",
+					 dev_name(dev), pm_verb(state.event), error);
 		dpm_save_failed_dev(dev_name(dev));
 		pm_dev_err(dev, state, async ? " async late" : " late", error);
 		goto Complete;
@@ -1657,6 +1681,7 @@ int dpm_suspend_late(pm_message_t state)
 		mutex_lock(&dpm_list_mtx);
 
 		if (error || async_error) {
+			dpm_async_suspend_complete_all(&dpm_suspended_list);
 			/*
 			 * Move all devices to the target list to resume them
 			 * properly.
@@ -1869,6 +1894,9 @@ static int device_suspend(struct device *dev, pm_message_t state, bool async)
 
 		dpm_propagate_wakeup_to_parent(dev);
 		dpm_clear_superiors_direct_complete(dev);
+	} else {
+		log_suspend_abort_reason("Device %s failed to %s: error %d",
+					 dev_name(dev), pm_verb(state.event), error);
 	}
 
 	device_unlock(dev);
@@ -1950,6 +1978,7 @@ int dpm_suspend(pm_message_t state)
 		mutex_lock(&dpm_list_mtx);
 
 		if (error || async_error) {
+			dpm_async_suspend_complete_all(&dpm_prepared_list);
 			/*
 			 * Move all devices to the target list to resume them
 			 * properly.
@@ -2148,6 +2177,9 @@ int dpm_prepare(pm_message_t state)
 		} else {
 			dev_info(dev, "not prepared for power transition: code %d\n",
 				 error);
+			log_suspend_abort_reason("Device %s not prepared for power transition: code %d",
+						 dev_name(dev), error);
+			dpm_save_failed_dev(dev_name(dev));
 		}
 
 		mutex_unlock(&dpm_list_mtx);
@@ -2176,8 +2208,10 @@ int dpm_suspend_start(pm_message_t state)
 	error = dpm_prepare(state);
 	if (error)
 		dpm_save_failed_step(SUSPEND_PREPARE);
-	else
+	else {
+		pm_restrict_gfp_mask();
 		error = dpm_suspend(state);
+	}
 
 	dpm_show_time(starttime, state, error, "start");
 	return error;

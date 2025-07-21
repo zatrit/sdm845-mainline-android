@@ -578,6 +578,7 @@ static const struct module_attribute modinfo_##field = {              \
 
 MODINFO_ATTR(version);
 MODINFO_ATTR(srcversion);
+MODINFO_ATTR(scmversion);
 
 static struct {
 	char name[MODULE_NAME_LEN + 1];
@@ -1028,6 +1029,7 @@ const struct module_attribute *const modinfo_attrs[] = {
 	&module_uevent,
 	&modinfo_version,
 	&modinfo_srcversion,
+	&modinfo_scmversion,
 	&modinfo_initstate,
 	&modinfo_coresize,
 #ifdef CONFIG_ARCH_WANTS_MODULES_DATA_IN_VMALLOC
@@ -1203,6 +1205,8 @@ static const struct kernel_symbol *resolve_symbol(struct module *mod,
 						  const char *name,
 						  char ownername[])
 {
+	bool is_vendor_module;
+	bool is_vendor_exported_symbol;
 	struct find_symbol_arg fsa = {
 		.name	= name,
 		.gplok	= !(mod->taints & (1 << TAINT_PROPRIETARY_MODULE)),
@@ -1236,6 +1240,24 @@ static const struct kernel_symbol *resolve_symbol(struct module *mod,
 	err = verify_namespace_is_imported(info, fsa.sym, mod);
 	if (err) {
 		fsa.sym = ERR_PTR(err);
+		goto getname;
+	}
+
+	/*
+	 * ANDROID GKI
+	 *
+	 * Vendor (i.e., unsigned) modules are only permitted to use:
+	 *
+	 * 1. symbols exported by other vendor (unsigned) modules
+	 * 2. unprotected symbols
+	 */
+	is_vendor_module = !mod->sig_ok;
+	is_vendor_exported_symbol = fsa.owner && !fsa.owner->sig_ok;
+
+	if (is_vendor_module &&
+	    !is_vendor_exported_symbol &&
+	    !gki_is_module_unprotected_symbol(name)) {
+		fsa.sym = ERR_PTR(-EACCES);
 		goto getname;
 	}
 
@@ -1461,6 +1483,14 @@ static int verify_exported_symbols(struct module *mod)
 				.name	= kernel_symbol_name(s),
 				.gplok	= true,
 			};
+
+			if (!mod->sig_ok && gki_is_module_protected_export(
+						kernel_symbol_name(s))) {
+				pr_err("%s: exports protected symbol %s\n",
+				       mod->name, kernel_symbol_name(s));
+				return -EACCES;
+			}
+
 			if (find_symbol(&fsa)) {
 				pr_err("%s: exports duplicate symbol %s"
 				       " (owned by %s)\n",
@@ -1541,9 +1571,15 @@ static int simplify_symbols(struct module *mod, const struct load_info *info)
 			     ignore_undef_symbol(info->hdr->e_machine, name)))
 				break;
 
-			ret = PTR_ERR(ksym) ?: -ENOENT;
-			pr_warn("%s: Unknown symbol %s (err %d)\n",
-				mod->name, name, ret);
+			if (PTR_ERR(ksym) == -EACCES) {
+				ret = -EACCES;
+				pr_warn("%s: Protected symbol: %s (err %d)\n",
+					mod->name, name, ret);
+			} else {
+				ret = PTR_ERR(ksym) ?: -ENOENT;
+				pr_warn("%s: Unknown symbol %s (err %d)\n",
+					mod->name, name, ret);
+			}
 			break;
 
 		default:
@@ -1573,8 +1609,14 @@ static int apply_relocations(struct module *mod, const struct load_info *info)
 		if (infosec >= info->hdr->e_shnum)
 			continue;
 
-		/* Don't bother with non-allocated sections */
-		if (!(info->sechdrs[infosec].sh_flags & SHF_ALLOC))
+		/*
+		 * Don't bother with non-allocated sections.
+		 * An exception is the percpu section, which has separate allocations
+		 * for individual CPUs. We relocate the percpu section in the initial
+		 * ELF template and subsequently copy it to the per-CPU destinations.
+		 */
+		if (!(info->sechdrs[infosec].sh_flags & SHF_ALLOC) &&
+		    (!infosec || infosec != info->index.pcpu))
 			continue;
 
 		if (info->sechdrs[i].sh_flags & SHF_RELA_LIVEPATCH)
@@ -2516,12 +2558,16 @@ static void module_augment_kernel_taints(struct module *mod, struct load_info *i
 	}
 #ifdef CONFIG_MODULE_SIG
 	mod->sig_ok = info->sig_ok;
+#ifndef CONFIG_MODULE_SIG_PROTECT
 	if (!mod->sig_ok) {
 		pr_notice_once("%s: module verification failed: signature "
 			       "and/or required key missing - tainting "
 			       "kernel\n", mod->name);
 		add_taint_module(mod, TAINT_UNSIGNED_MODULE, LOCKDEP_STILL_OK);
 	}
+#endif
+#else
+	mod->sig_ok = 0;
 #endif
 
 	/*
@@ -2696,9 +2742,8 @@ static int find_module_sections(struct module *mod, struct load_info *info)
 
 static int move_module(struct module *mod, struct load_info *info)
 {
-	int i;
-	enum mod_mem_type t = 0;
-	int ret = -ENOMEM;
+	int i, ret;
+	enum mod_mem_type t = MOD_MEM_NUM_TYPES;
 	bool codetag_section_found = false;
 
 	for_each_mod_mem_type(type) {
@@ -2776,7 +2821,7 @@ static int move_module(struct module *mod, struct load_info *info)
 	return 0;
 out_err:
 	module_memory_restore_rox(mod);
-	for (t--; t >= 0; t--)
+	while (t--)
 		module_memory_free(mod, t);
 	if (codetag_section_found)
 		codetag_free_module_sections(mod);

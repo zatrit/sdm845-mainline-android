@@ -69,6 +69,8 @@
 #include "policycap_names.h"
 #include "ima.h"
 
+#include <trace/hooks/selinux.h>
+
 struct selinux_policy_convert_data {
 	struct convert_context_args args;
 	struct sidtab_convert_params sidtab_params;
@@ -1909,11 +1911,17 @@ retry:
 			goto out_unlock;
 	}
 	/* Obtain the sid for the context. */
-	rc = sidtab_context_to_sid(sidtab, &newcontext, out_sid);
-	if (rc == -ESTALE) {
-		rcu_read_unlock();
-		context_destroy(&newcontext);
-		goto retry;
+	if (context_equal(scontext, &newcontext))
+		*out_sid = ssid;
+	else if (context_equal(tcontext, &newcontext))
+		*out_sid = tsid;
+	else {
+		rc = sidtab_context_to_sid(sidtab, &newcontext, out_sid);
+		if (rc == -ESTALE) {
+			rcu_read_unlock();
+			context_destroy(&newcontext);
+			goto retry;
+		}
 	}
 out_unlock:
 	rcu_read_unlock();
@@ -2163,6 +2171,11 @@ static void security_load_policycaps(struct selinux_policy *policy)
 			pr_info("SELinux:  unknown policy capability %u\n",
 				i);
 	}
+
+	WRITE_ONCE(selinux_state.android_netlink_route, p->android_netlink_route);
+	WRITE_ONCE(selinux_state.android_netlink_getneigh,
+			p->android_netlink_getneigh);
+	selinux_nlmsg_init();
 }
 
 static int security_preserve_bools(struct selinux_policy *oldpolicy,
@@ -2255,6 +2268,7 @@ void selinux_policy_commit(struct selinux_load_state *load_state)
 		 */
 		selinux_mark_initialized();
 		selinux_complete_init();
+		trace_android_rvh_selinux_is_initialized(state);
 	}
 
 	/* Free the old policy */

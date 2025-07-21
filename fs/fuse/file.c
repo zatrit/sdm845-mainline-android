@@ -1147,7 +1147,7 @@ static ssize_t fuse_send_write_pages(struct fuse_io_args *ia,
 static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 				     struct address_space *mapping,
 				     struct iov_iter *ii, loff_t pos,
-				     unsigned int max_pages)
+				     unsigned int max_folios)
 {
 	struct fuse_args_pages *ap = &ia->ap;
 	struct fuse_conn *fc = get_fuse_conn(mapping->host);
@@ -1157,12 +1157,11 @@ static ssize_t fuse_fill_write_pages(struct fuse_io_args *ia,
 	int err = 0;
 
 	num = min(iov_iter_count(ii), fc->max_write);
-	num = min(num, max_pages << PAGE_SHIFT);
 
 	ap->args.in_pages = true;
 	ap->descs[0].offset = offset;
 
-	while (num) {
+	while (num && ap->num_folios < max_folios) {
 		size_t tmp;
 		struct folio *folio;
 		pgoff_t index = pos >> PAGE_SHIFT;
@@ -2366,8 +2365,16 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
 	 */
 	if (fuse_file_passthrough(ff))
 		return fuse_passthrough_mmap(file, vma);
+	/*
+	 * Old Android passthrough did not handle this case, but did allow the mmap to continue.
+	 * This will not cleanly handle the case of a shared mmap across passthrough and
+	 * nonpassthrough at the same time, although shared mmap through cache and file io through
+	 * the lower filesystem should work as expected, at a performance penalty.
+	 */
+#if 0
 	else if (fuse_inode_backing(get_fuse_inode(inode)))
 		return -ENODEV;
+#endif
 
 	/*
 	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
@@ -3166,6 +3173,7 @@ void fuse_init_file_inode(struct inode *inode, unsigned int flags)
 	INIT_LIST_HEAD(&fi->queued_writes);
 	fi->writectr = 0;
 	fi->iocachectr = 0;
+	fi->iopassctr = 0;
 	init_waitqueue_head(&fi->page_waitq);
 	init_waitqueue_head(&fi->direct_io_waitq);
 
